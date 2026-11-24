@@ -128,3 +128,227 @@ Create a **simple HTML page** (served by your Express app at `GET /feedback`) co
 - A short **viva/demo (10 minutes)** walkthrough.
 
 **Automatic penalties:** SQL injection vector anywhere in the app (−15), secrets committed to the repo (−5), app does not start per README instructions (−10), work the student cannot explain in the video (or at a follow-up viva if called) | Academic integrity referral; affected criteria re-scored at Developing or below |
+
+
+
+
+
+# Video Demo
+https://drive.google.com/file/d/1wYqL_FpUfX_m2mowuFuOOlHFE-qowH68/view?usp=sharing
+
+
+
+
+
+
+
+# Additional README Part: MediBook Clinic Appointment API
+
+Backend for a community clinic that books doctors into fixed 30-minute slots (09:00–17:00), caps each doctor at 12 appointments a day, and keeps cancellation and refund history. Stack: Node.js, Express, MySQL (parameterized queries only, no ORM), Redis.
+
+## Setup
+
+Requirements: Node.js 18+, MySQL 8.0.16+ (CHECK constraints must be enforced), Redis.
+
+```bash
+npm install
+copy .env.example .env
+```
+
+Create the database and load sample data (adjust the MySQL user if yours is not `root`):
+
+```bash
+mysql -u root -p < database/schema.sql
+mysql -u root -p < database/seed.sql
+```
+
+`schema.sql` creates the `medibook` database and the three tables. `seed.sql` loads 5 patients, 3 doctors (Dr. Uwase has no appointments), and 15 appointments. Eleven of those are Dr. Boateng two days from the day you run the seed (11 of the 12 daily slots). Dates in the seed are relative to `CURDATE()`, so re-run `seed.sql` if the sample appointments have gone stale.
+
+Start Redis, then the API and the worker in two terminals:
+
+```bash
+npm run dev
+npm run worker
+```
+
+The API listens on `http://localhost:3000`. Tests do not need MySQL or Redis:
+
+```bash
+npm test
+```
+
+## Environment
+
+Copy `.env.example` to `.env`. Do not commit `.env` (it is gitignored).
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `PORT` | `3000` | HTTP port |
+| `DB_HOST` | `localhost` | MySQL host |
+| `DB_PORT` | `3306` | MySQL port |
+| `DB_USER` | `root` | MySQL user |
+| `DB_PASSWORD` | *(empty locally)* | MySQL password |
+| `DB_NAME` | `medibook` | Database name |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection |
+
+## Refund policy
+
+Notice is the time from cancellation until the appointment starts.
+
+| Notice | Refund |
+|---|---|
+| More than 48 hours | 100% |
+| Exactly 48 hours, down to exactly 24 hours | 50% |
+| Less than 24 hours | 0% |
+
+The last bookable slot is 16:30. A 17:00 start is rejected because the slot would run past closing.
+
+## API
+
+All JSON bodies use camelCase. Errors look like `{ "error": { "message": "..." } }` and come from one error-handling middleware.
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/patients` | List patients |
+| `POST` | `/patients` | Create a patient (`201`) |
+| `GET` | `/patients/:id` | One patient |
+| `PATCH` | `/patients/:id` | Partial update |
+| `DELETE` | `/patients/:id` | Delete (`204`). `409` if they still have appointments |
+| `GET` | `/doctors` | List doctors |
+| `POST` | `/doctors` | Create a doctor (`201`) |
+| `GET` | `/doctors/:id` | One doctor |
+| `PATCH` | `/doctors/:id` | Partial update |
+| `DELETE` | `/doctors/:id` | Delete (`204`). `409` if they still have appointments |
+| `GET` | `/doctors/:id/stats` | Revenue, upcoming count, next 7 days, utilization % |
+| `GET` | `/doctors/:id/waitlist?date=YYYY-MM-DD` | Waitlist for that doctor-day |
+| `POST` | `/appointments` | Book. `201` booked, `202` waitlisted, `409` if the slot or day is full and `joinWaitlist` was not sent |
+| `GET` | `/appointments/:id` | One appointment, including cancelled ones |
+| `PATCH` | `/appointments/:id/cancel` | Cancel and return the refund |
+| `GET` | `/reports/doctors` | Every doctor, appointment count and revenue (includes zeros) |
+| `GET` | `/reports/busy-days` | Doctor-days booked above 80% of 12 slots |
+| `GET` | `/feedback` | Course feedback form. `?lang=fr` for French; unknown `lang` falls back to English |
+| `POST` | `/feedback` | Accepts the form and shows a confirmation page |
+
+Patient body: `fullName`, `email`, `phone`. Doctor body: `fullName`, `specialty`, `consultationFee`, `room`. Booking body: `patientId`, `doctorId`, `appointmentDatetime` (`YYYY-MM-DDTHH:mm`), optional `joinWaitlist` (boolean).
+
+## Design notes
+
+**Booking and conflicts (Part C).** A booking runs in one transaction. The doctor row is locked (`SELECT ... FOR UPDATE`) so two requests for the same doctor cannot both pass the 12-a-day check. The slot itself is protected by `UNIQUE (doctor_id, active_slot)`. `active_slot` is a generated column: the appointment time while status is `booked`, and `NULL` once cancelled. MySQL allows many `NULL`s in a unique key, so a cancelled row stays for refund history and the time becomes bookable again. A duplicate insert becomes `409`. The same pattern stops one patient holding two appointments at the same time and also amount paid is copied from the doctor's fee at booking time so a later fee change does not rewrite history. Reports (doctor totals, busy days, the 7-day utilization) are SQL aggregates and joins in the models, including doctors with zero appointments via `LEFT JOIN`.
+
+**Audit log (Part D).** Successful bookings and cancellations append one JSON line to `logs/audit.log` with `fs.promises.appendFile`. The logger creates `logs/` on first use. The call is not awaited in a way that can fail the HTTP response: a write error is logged to the console and the booking or cancellation still returns success. No `*Sync` fs calls run inside request handlers.
+
+**Queues (Part E).** Redis lists, not an extra queue library. If the slot or the day is full, the API returns `409` and tells the client to resend with `"joinWaitlist": true`, which pushes the patient onto that doctor-day's list (`202`). A separate process (`npm run worker`) blocks on two lists: confirmation jobs and promotion jobs. Every confirmed booking enqueues a confirmation job; the worker writes the "SMS/email" text to the audit log. Cancellation enqueues a promotion for that doctor-day. The worker tries waitlisted patients in order and only removes someone from the list after a booking succeeds. If the slot is already taken it tries the next person. If the day is still full it stops and leaves the queue intact. If the booking throws an unexpected error, the job is retried up to 3 times and then moved to a failed-jobs list, so the patient is not dropped from both the queue and the appointments table.
+
+## Tests
+
+`npm test` runs 28 Jest tests with no database:
+
+- Refund calculator: 100%, 50%, and 0% tiers, plus the 24-hour and 48-hour boundaries (exactly 48 hours is 50%; one minute more than 48 hours is 100%; exactly 24 hours is 50%; one minute under 24 hours is 0%).
+- Slot validator: future-only, 30-minute boundaries, working hours, 16:30 accepted, 17:00 rejected, 09:15 rejected, malformed dates rejected.
+
+
+## Postman checks
+
+Set the request URL to `http://localhost:3000` plus the path below. For any request with a body, set the header `Content-Type` to `application/json` and paste the JSON into the raw body.
+
+After a fresh seed, patient ids are 1–5 and doctor ids are 1 (Boateng, Dermatology, 150), 2 (Adjei, Paediatrics, 100), 3 (Uwase, Cardiology, 200, no appointments). `2027-03-02` only has to be a future time on a 30-minute mark between 09:00 and 16:30.
+
+Reads, no body. Expect `200`.
+
+| Method | Path |
+|---|---|
+| `GET` | `/patients` |
+| `GET` | `/doctors` |
+| `GET` | `/doctors/1/stats` |
+| `GET` | `/reports/doctors` |
+| `GET` | `/reports/busy-days` |
+
+Create a patient. Expect `201`. Send the same body again and expect `409`.
+
+`POST /patients`
+
+```json
+{
+  "fullName": "Test Patient",
+  "email": "test.patient@mail.com",
+  "phone": "0788001122"
+}
+```
+
+Missing fields. Expect `400`.
+
+
+Book Dr. Uwase. Expect `201`. Use a real patient id (`5` is Grace Mukamana on a fresh seed). Copy `data.id` from the response; that is the appointment id for the cancel step.
+
+`POST /appointments`
+
+```json
+{
+  "patientId": 5,
+  "doctorId": 3,
+  "appointmentDatetime": "2027-03-02T09:00"
+}
+```
+
+Same slot, different patient. Expect `409`.
+
+`POST /appointments`
+
+```json
+{
+  "patientId": 1,
+  "doctorId": 3,
+  "appointmentDatetime": "2027-03-02T09:00"
+}
+```
+
+Join the waitlist. Expect `202` while Redis and the worker are running. Expect `503` if Redis is down.
+
+`POST /appointments`
+
+```json
+{
+  "patientId": 1,
+  "doctorId": 3,
+  "appointmentDatetime": "2027-03-02T09:00",
+  "joinWaitlist": true
+}
+```
+
+`GET /doctors/3/waitlist?date=2027-03-02` — expect `200` and patient 1 on the list.
+
+Not on a 30-minute boundary. Expect `422`.
+
+`POST /appointments`
+
+```json
+{
+  "patientId": 2,
+  "doctorId": 3,
+  "appointmentDatetime": "2027-03-02T09:15"
+}
+```
+
+Starts at closing time. Expect `422`.
+
+`POST /appointments`
+
+```json
+{
+  "patientId": 2,
+  "doctorId": 3,
+  "appointmentDatetime": "2027-03-02T17:00"
+}
+```
+
+Cancel the appointment from the `201` response. No body. Replace `{id}` with that id. Expect `200` and a refund amount (`200.00`, 100%, for a date this far ahead).
+
+`PATCH /appointments/{id}/cancel`
+
+`GET /appointments/{id}` — the same row, now `status` `cancelled`.
+
+If the worker is running, patient 1 is booked into `09:00` and `logs/audit.log` gains a `WAITLIST_PROMOTED` line.
+
+Feedback is a browser page, not JSON: `http://localhost:3000/feedback`, `http://localhost:3000/feedback?lang=fr`, and `http://localhost:3000/feedback?lang=de` (still English).
+
+What “working” looks like: `npm test` is green; a valid booking returns `201` and a line in `logs/audit.log`; the worker prints a confirmation; a duplicate slot returns `409`; cancel returns a refund and keeps the row as `cancelled`; `/reports/doctors` includes a doctor with zero appointments when you have not booked Dr. Uwase yet.
